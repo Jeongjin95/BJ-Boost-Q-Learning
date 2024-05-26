@@ -1,0 +1,247 @@
+# Clear the environment
+rm(list = ls())
+
+# Load required libraries
+library(data.table)
+library(survival)
+library(MASS)
+library(missForest)
+library(mice)
+library(sn)
+library(ggplot2)
+library(purrr)
+library(emplik)
+library(rms)
+library(caret)
+library(rootSolve)
+library(scorecard)
+library(dplyr)
+library(bujar)
+library(patchwork)
+
+# Set seed for reproducibility
+set.seed(7777)
+
+# Number of patients
+n <- 500
+
+# Function to generate random treatments based on given proportions
+assign_treatments <- function(n, proportions) {
+  treatments <- c("A", "B", "P")
+  sample(treatments, size = n, replace = TRUE, prob = proportions)
+}
+
+# Stage 1: Initial treatment assignment and patient data generation
+states_stage1 <- data.table(
+  Treatment = assign_treatments(n, c(1/3, 1/3, 1/3)),
+  TumorSize = numeric(n),
+  Severity = numeric(n),
+  survival.month.1st = numeric(n)
+)
+
+# Define Tumor Size and Severity based on treatment in Stage 1
+states_stage1$TumorSize[states_stage1$Treatment == "A"] <- runif(sum(states_stage1$Treatment == "A"), 5, 10)
+states_stage1$TumorSize[states_stage1$Treatment == "B"] <- runif(sum(states_stage1$Treatment == "B"), 3, 6)
+states_stage1$TumorSize[states_stage1$Treatment == "P"] <- runif(sum(states_stage1$Treatment == "P"), 1, 3)
+states_stage1$Severity <- as.numeric(factor(states_stage1$Treatment, levels = c("A", "B", "P"), labels = c(3, 2, 1)))
+
+# Generate survival time for Stage 1
+states_stage1$survival.month.1st <- 30 - states_stage1$TumorSize - states_stage1$Severity + rsn(n)
+
+combined_data <- data.table(
+  Treatment1 = states_stage1$Treatment,
+  Survival1 = states_stage1$survival.month.1st,
+  Treatment_Combination = paste0(states_stage1$Treatment),
+  Total_Survival = states_stage1$survival.month.1st
+)
+
+# Censoring
+Censoring <- runif(n, 10, 30)
+delta <- ifelse(states_stage1$survival.month.1st <= Censoring, 1, 0)
+states_stage1$y <- pmin(states_stage1$survival.month.1st, Censoring)
+states_stage1$delta <- delta
+
+# Buckley-James AFT model function
+bjaft <- function(dt, tol = 1e-3, max.iter = 100) {
+  Y <- dt$y
+  delta <- dt$delta
+  x <- cbind(dt$TumorSize, dt$Severity)
+  old.beta <- lm(log(Y) ~ x)$coef[-1]
+  
+  err <- 10
+  iter <- 0
+  while (max.iter > iter & err > tol) {
+    xbeta <- c(x %*% old.beta)
+    e <- log(Y) - xbeta
+    es <- sort(e)
+    sfit <- survfit(Surv(e, delta) ~ 1)
+    Fhat <- 1 - approx(x = sfit$time, y = sfit$surv, xout = es)$y
+    dF <- diff(c(0, Fhat))
+    denom <- 1 - Fhat
+    num <- rev(cumsum(rev(es * dF)))
+    Yimp <- (num / pmax(tol, denom))[rank(e)] + xbeta
+    Yhat <- log(Y) * delta + (1 - delta) * Yimp
+    
+    new.beta <- lm(Yhat ~ x)$coef[-1]
+    err <- max(abs(new.beta - old.beta))
+    iter <- iter + 1
+    old.beta <- new.beta
+  }
+  list(coef = round(new.beta, 3), iter = iter, Yhat = Yhat)
+}
+
+# Buckley-James AFT model imputation
+imputed_Yhat <- exp(bjaft(states_stage1)$Yhat)
+combined_data$Survival.sum <- imputed_Yhat
+Imputed.data <- data.frame(combined_data$Treatment_Combination, as.numeric(combined_data$Survival.sum))
+
+# Plotting
+p1 <- ggplot(combined_data, aes(x = Treatment_Combination, y = Total_Survival)) +
+  geom_boxplot() +
+  labs(title = "True Survival", x = "Treatment Combination", y = "Survival Time") +
+  ylim(17, 28)
+
+p2 <- ggplot(Imputed.data, aes(x = factor(Imputed.data[, 1]), y = Imputed.data[, 2])) +
+  geom_boxplot() +
+  labs(title = "BJ", x = "Treatment Combination", y = "Survival Time") +
+  ylim(17, 28)
+
+################################################################################
+# BJ twin boosting with componentwise least squares + Q learning ###############
+################################################################################
+imputed.y <- bujar(y = log(states_stage1$y), cens = states_stage1$delta, x = cbind(states_stage1$TumorSize, states_stage1$Severity),
+                   cv = FALSE, mstop = 1000, twin = TRUE, mstop2 = 100)$ynew
+BJLS <- exp(imputed.y)
+
+num_states <- 1
+num_actions <- 3
+Q_list <- vector("list", n)
+for (j in 1:n) {
+  Q_list[[j]] <- matrix(0, nrow = num_states, ncol = num_actions)
+}
+alpha <- 0.1  # Learning rate
+gamma <- 0.9  # Discount factor
+epsilon <- 0.2  # Epsilon for epsilon-greedy policy
+num_iterations <- 1000  # Number of iterations for Q-value updates
+
+for (j in 1:n) {
+  for (iteration in 1:num_iterations) {
+    # Update Q-value for state 1
+    state1 <- 1
+    if (runif(1) < epsilon) {
+      # Explore: choose a random action
+      action1 <- sample(1:num_actions, 1)
+    } else {
+      # Exploit: choose the action with the highest Q-value
+      action1 <- which.max(Q_list[[j]][state1, ])
+    }
+    survival1 <- BJLS[j]
+    Severity1 <- states_stage1$Severity
+    reward1 <- c(survival1, survival1, survival1)[action1] +
+      5 * c(Severity1[j] == 3, Severity1[j] == 2, Severity1[j] == 1)[action1]
+    Q_list[[j]][state1, action1] <- (1 - alpha) * reward1
+  }
+}
+
+Q_list
+Optimal.policy <- matrix(0, n, 1)
+for (v in 1:n) {
+  Optimal.policy[v, 1] <- which.max(Q_list[[v]][1, ])
+}
+Optimal.policy[Optimal.policy == 1] <- 'P'
+Optimal.policy[Optimal.policy == 2] <- 'B'
+Optimal.policy[Optimal.policy == 3] <- 'A'
+colnames(Optimal.policy) <- c("OP.Trt1")
+Optimal.policy == states_stage1$Treatment 
+
+p4 <- ggplot(Imputed.data, aes(x = factor(Imputed.data[, 1]), y = BJLS)) +
+  geom_boxplot() +
+  labs(title = "BJ-Imputation (Twin Boosting)", x = "Treatment Combination", y = "Survival Time") +
+  ylim(17, 28)
+
+################################################################################
+# BJ boosting with regression stumps (BJ-Tree) + Q learning ####################
+################################################################################
+BJTree <- exp(bujar(y = log(states_stage1$y), cens = states_stage1$delta, 
+                    x = states_stage1[, c("TumorSize", "Severity")], 
+                    learner = "tree", tuning = TRUE, cv = TRUE, degree = 4,  
+                    mstop = 1000, n.cores = 1, rng = 123)$ynew)
+
+num_states <- 1
+num_actions <- 3
+Q_list <- vector("list", n)
+for (j in 1:n) {
+  Q_list[[j]] <- matrix(0, nrow = num_states, ncol = num_actions)
+}
+alpha <- 0.1  # Learning rate
+gamma <- 0.9  # Discount factor
+epsilon <- 0.2  # Epsilon for epsilon-greedy policy
+num_iterations <- 1000  # Number of iterations for Q-value updates
+
+for (j in 1:n) {
+  for (iteration in 1:num_iterations) {
+    # Update Q-value for state 1
+    state1 <- 1
+    if (runif(1) < epsilon) {
+      # Explore: choose a random action
+      action1 <- sample(1:num_actions, 1)
+    } else {
+      # Exploit: choose the action with the highest Q-value
+      action1 <- which.max(Q_list[[j]][state1, ])
+    }
+    survival1 <- BJTree[j]
+    Severity1 <- states_stage1$Severity
+    reward1 <- c(survival1, survival1, survival1)[action1] +
+      5 * c(Severity1[j] == 3, Severity1[j] == 2, Severity1[j] == 1)[action1]
+    Q_list[[j]][state1, action1] <- (1 - alpha) * reward1
+  }
+}
+
+Q_list
+Optimal.policy <- matrix(0, n, 1)
+for (v in 1:n) {
+  Optimal.policy[v, 1] <- which.max(Q_list[[v]][1, ])
+}
+Optimal.policy[Optimal.policy == 1] <- 'P'
+Optimal.policy[Optimal.policy == 2] <- 'B'
+Optimal.policy[Optimal.policy == 3] <- 'A'
+colnames(Optimal.policy) <- c("OP.Trt1")
+Optimal.policy == states_stage1$Treatment
+
+p5 <- ggplot(Imputed.data, aes(x = factor(Imputed.data[, 1]), y = BJTree)) +
+  geom_boxplot() +
+  labs(title = "BJ-Imputation (Tree)", x = "Treatment Combination", y = "Survival Time") +
+  ylim(17, 28)
+
+p3 <- ggplot(Imputed.data, aes(x = factor(Imputed.data[, 1]), y = states_stage1$y)) +
+  geom_boxplot() +
+  labs(title = "Non-Imputed Survival", x = "Treatment Combination", y = "Survival Time") +
+  ylim(17, 28)
+
+combined_plot <- p1 + p4 + p5 + p3 + plot_layout(ncol = 4)
+print(combined_plot)
+
+# Survival analysis
+TS <- states_stage1$survival.month.1st
+Non.imputed <- states_stage1$y
+
+# Survival analysis with BJLS
+method <- c(rep("TS", n), rep("BJLS", n))
+time <- c(TS, BJLS)
+status <- rep(1, length(time))
+fit <- survfit(Surv(time, status) ~ method)
+survdiff(Surv(time, status) ~ method)
+
+# Survival analysis with BJTree
+method <- c(rep("TS", n), rep("BJTree", n))
+time <- c(TS, BJTree)
+status <- rep(1, length(time))
+fit <- survfit(Surv(time, status) ~ method)
+survdiff(Surv(time, status) ~ method)
+
+# Survival analysis with Non-imputed
+method <- c(rep("TS", n), rep("Non-imputed", n))
+time <- c(TS, Non.imputed)
+status <- rep(1, length(time))
+fit <- survfit(Surv(time, status) ~ method)
+survdiff(Surv(time, status) ~ method)
