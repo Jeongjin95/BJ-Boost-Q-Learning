@@ -1,3 +1,3 @@
 # BJ-Boost-Q-Learning
 
-Upload full code after revision. 
+Will provide the full code after making the revisions. Upload the simplest case.
