@@ -1,0 +1,197 @@
+# Clear environment
+rm(list = ls())
+
+# Load required libraries
+library(data.table)
+library(survival)
+library(bujar)
+library(dplyr)
+
+# Set seed for reproducibility
+set.seed(1111)
+
+# Number of patients
+n <- 500
+
+# Function to assign treatments
+assign_treatments <- function(n, proportions) {
+  treatments <- c("A", "B")
+  sample(treatments, size = n, replace = TRUE, prob = proportions)
+}
+
+# Function to calculate confidence intervals
+calculate_confidence_interval <- function(values, confidence_level = 0.95) {
+  n <- length(values)
+  mean_value <- mean(values)
+  stderr <- sd(values) / sqrt(n)
+  error_margin <- qnorm((1 + confidence_level) / 2) * stderr
+  lower_bound <- mean_value - error_margin
+  upper_bound <- mean_value + error_margin
+  return(c(mean = mean_value, lower = lower_bound, upper = upper_bound))
+}
+
+# Replication function
+replicate_analysis <- function() {
+  # Generate Stage 1 data
+  states_stage1 <- data.table(
+    Treatment = assign_treatments(n, c(1/2, 1/2)),
+    TumorSize = numeric(n),
+    Severity = numeric(n),
+    survival.month.1st = numeric(n)
+  )
+  
+  # Define Tumor Size and Severity
+  states_stage1$TumorSize[states_stage1$Treatment == "A"] <- runif(sum(states_stage1$Treatment == "A"), 5, 6)
+  states_stage1$TumorSize[states_stage1$Treatment == "B"] <- runif(sum(states_stage1$Treatment == "B"), 3, 4)
+  states_stage1$Severity <- as.numeric(factor(states_stage1$Treatment, levels = c("A", "B"), labels = c(2, 0)))
+  
+  # Generate survival time
+  states_stage1$survival.month.1st <- 20 - 0.5 * states_stage1$TumorSize^2 - 1.5 * log(states_stage1$Severity + 1) + rnorm(n, 0, 1)
+  states_stage1$survival.month.1st <- pmax(states_stage1$survival.month.1st, 0.0001)
+  states_stage1$survival.month.1st <- 20 - 2*states_stage1$TumorSize - states_stage1$Severity + rnorm(n, 0, 0.5)
+  states_stage1$survival.month.1st <- pmax(states_stage1$survival.month.1st, 0.0001)
+  
+  # Generate Stage 2 data
+  states_stage2 <- data.table(
+    Treatment = assign_treatments(n, c(1/2, 1/2)),
+    TumorSize = numeric(n),
+    Severity = numeric(n),
+    survival.month.2nd = numeric(n)
+  )
+  
+  # Define Tumor Size and Severity
+  states_stage2$TumorSize[states_stage2$Treatment == "A"] <- runif(sum(states_stage2$Treatment == "A"), 5, 6)
+  states_stage2$TumorSize[states_stage2$Treatment == "B"] <- runif(sum(states_stage2$Treatment == "B"), 3, 4)
+  states_stage2$Severity <- as.numeric(factor(states_stage2$Treatment, levels = c("A", "B"), labels = c(2, 0)))
+  
+  # Generate survival time for Stage 2
+  states_stage2$survival.month.2nd <- 20 - 0.5 * states_stage2$TumorSize^2 - 1.5 * log(states_stage2$Severity + 1) + rnorm(n, 0, 1)
+  states_stage2$survival.month.2nd <- pmax(states_stage2$survival.month.2nd, 0.0001)
+  states_stage2$survival.month.2nd <- 20 - 2*states_stage2$TumorSize - states_stage2$Severity + rnorm(n, 0, 0.5)
+  states_stage2$survival.month.2nd <- pmax(states_stage2$survival.month.2nd, 0.0001)
+  
+  # Censoring
+  states_stage1$censored_time <- pmin(states_stage1$survival.month.1st, runif(n, 0, 20))
+  states_stage1$delta <- as.numeric(states_stage1$survival.month.1st <= states_stage1$censored_time)
+  
+  states_stage2$censored_time <- pmin(states_stage2$survival.month.2nd, runif(n, 0, 20))
+  states_stage2$delta <- as.numeric(states_stage2$survival.month.2nd <= states_stage2$censored_time)
+  
+  # BJ method using both stages
+  bjaft <- function(dt, tol = 1e-3, max.iter = 100) {
+    Y <- dt$y
+    delta <- dt$delta
+    x <- cbind(dt$TumorSize, dt$Severity)
+    old.beta <- lm(log(Y) ~ x)$coef[-1]
+    
+    err <- 10
+    iter <- 0
+    while (max.iter > iter & err > tol) {
+      xbeta <- c(x %*% old.beta)
+      e <- log(Y) - xbeta
+      es <- sort(e)
+      sfit <- survfit(Surv(e, delta) ~ 1)
+      Fhat <- 1 - approx(x = sfit$time, y = sfit$surv, xout = es)$y
+      dF <- diff(c(0, Fhat))
+      denom <- 1 - Fhat
+      num <- rev(cumsum(rev(es * dF)))
+      Yimp <- (num / pmax(tol, denom))[rank(e)] + xbeta
+      Yhat <- log(Y) * delta + (1 - delta) * Yimp
+      
+      new.beta <- lm(Yhat ~ x)$coef[-1]
+      err <- max(abs(new.beta - old.beta))
+      iter <- iter + 1
+      old.beta <- new.beta
+    }
+    list(coef = round(new.beta, 3), iter = iter, Yhat = Yhat)
+  }
+  
+  BJ_stage1 <- exp(bjaft(data.table(y = states_stage1$censored_time, delta = states_stage1$delta, TumorSize = states_stage1$TumorSize, Severity = states_stage1$Severity))$Yhat)
+  BJ_stage2 <- exp(bjaft(data.table(y = states_stage2$censored_time, delta = states_stage2$delta, TumorSize = states_stage2$TumorSize, Severity = states_stage2$Severity))$Yhat)
+  
+  BJ <- BJ_stage1 + BJ_stage2
+  
+  # BJ twin boosting using both stages
+  BJLS.1 <- exp(bujar(
+    y = log(states_stage1$censored_time), cens = states_stage1$delta,
+    x = cbind(states_stage1$TumorSize, states_stage1$Severity),
+    twin = TRUE, mstop = 1000
+  )$ynew)
+  
+  BJLS.2 <- exp(bujar(
+    y = log(states_stage2$censored_time), cens = states_stage2$delta,
+    x = cbind(states_stage2$TumorSize, states_stage2$Severity),
+    twin = TRUE, mstop = 1000
+  )$ynew)
+  
+  BJLS <- BJLS.1 + BJLS.2
+  
+  # BJ boosting Tree using both stages
+  BJTree.1 <- exp(bujar(
+    y = log(states_stage1$censored_time), cens = states_stage1$delta,
+    x = states_stage1[, c("TumorSize", "Severity")],
+    learner = "tree", tuning = TRUE, cv = FALSE, degree = 4,
+    mstop = 1000, n.cores = 1, rng = 123
+  )$ynew)
+  
+  BJTree.2 <- exp(bujar(
+    y = log(states_stage2$censored_time), cens = states_stage2$delta,
+    x = states_stage2[, c("TumorSize", "Severity")],
+    learner = "tree", tuning = TRUE, cv = FALSE, degree = 4,
+    mstop = 1000, n.cores = 1, rng = 123
+  )$ynew)
+  
+  BJTree <- BJTree.1 + BJTree.2
+  
+  # Define thresholds
+  thresholds_BJ <- quantile(BJ, c(1/3, 2/3))
+  thresholds_BJLS <- quantile(BJLS, c(1/3, 2/3))
+  thresholds_BJTree <- quantile(BJTree, c(1/3, 2/3))
+  
+  # Assign policies
+  BJ_est.policy <- cut(
+    BJ,
+    breaks = c(-Inf, thresholds_BJ[1], thresholds_BJ[2], Inf),
+    labels = c("AA", "AB+BA", "BB")
+  )
+  
+  BJLS_est.policy <- cut(
+    BJLS,
+    breaks = c(-Inf, thresholds_BJLS[1], thresholds_BJLS[2], Inf),
+    labels = c("AA", "AB+BA", "BB")
+  )
+  
+  BJTree_est.policy <- cut(
+    BJTree,
+    breaks = c(-Inf, thresholds_BJTree[1], thresholds_BJTree[2], Inf),
+    labels = c("AA", "AB+BA", "BB")
+  )
+  
+  # Compute accuracy
+  true_policy <- paste0(states_stage1$Treatment, states_stage2$Treatment)
+  true_policy_grouped <- ifelse(true_policy %in% c("AB", "BA"), "AB+BA", true_policy)
+  
+  accuracy_BJ <- mean(BJ_est.policy == true_policy_grouped)
+  accuracy_BJLS <- mean(BJLS_est.policy == true_policy_grouped)
+  accuracy_BJTree <- mean(BJTree_est.policy == true_policy_grouped)
+  
+  # Return accuracies
+  return(c(accuracy_BJ, accuracy_BJLS, accuracy_BJTree))
+}
+
+# Perform replications
+results <- replicate(100, replicate_analysis(), simplify = TRUE)
+
+# Convert results to data frame
+results_df <- as.data.frame(t(results))
+colnames(results_df) <- c("BJ", "BJ LS", "BJ Tree")
+
+# Calculate mean and confidence intervals
+summary_results <- data.frame(
+  Method = colnames(results_df),
+  Mean_Accuracy = colMeans(results_df),
+  t(apply(results_df, 2, calculate_confidence_interval))
+)
+
+# Print summary results
+summary_results
