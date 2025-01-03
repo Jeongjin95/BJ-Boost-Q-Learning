@@ -134,7 +134,7 @@ generate_data_and_pvalues <- function(seed) {
 # Initialize list to store p-values
 p_values <- list()
 
-# Perform 10 replications with different seeds using a for loop
+# Perform 100 replications with different seeds using a for loop
 for (i in 1:100) {
   p_values[[i]] <- generate_data_and_pvalues(i)
 }
