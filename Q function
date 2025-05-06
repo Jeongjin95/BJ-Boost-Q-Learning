@@ -1,0 +1,214 @@
+rm(list = ls())
+library(bujar)
+library(survival)
+library(ggplot2)
+library(tidyr)
+
+set.seed(1234)
+
+# Sample size and covariates
+n <- 1000
+Sex <- rbinom(n, 1, 0.5)
+TumorSize <- runif(n, -2, 3)
+TumorSize <- TumorSize^2 - median(TumorSize)
+
+# True parameters
+beta_0 <- 10
+beta_1 <- 0.1
+beta_2 <- -1
+gamma_1 <- 0.01
+gamma_2 <- 1.3
+
+# True Q-values
+Q_A_true <- pmax(beta_0 + beta_1 * Sex + beta_2 * TumorSize + gamma_1 + gamma_2 * TumorSize, 0.001)
+Q_B_true <- pmax(beta_0 + beta_1 * Sex + beta_2 * TumorSize, 0.001)
+
+# Treatment assignment and outcome generation
+epsilon <- rnorm(n)
+A <- rbinom(n, 1, 0.5)
+T_true <- ifelse(A == 1, Q_A_true, Q_B_true) + epsilon
+T_true <- pmax(T_true, 0.01)  
+C <- runif(n, quantile(T_true, 0.2), quantile(T_true, 0.8))
+Y <- pmin(T_true, C)
+delta <- as.numeric(T_true <= C)
+mean(delta)
+
+# Data frame
+df <- data.frame(Sex, TumorSize, A, T_obs = Y, delta, Q_A_true, Q_B_true)
+df_A <- df[df$A == 1, ]
+df_B <- df[df$A == 0, ]
+x_A <- as.matrix(df_A[, c("Sex", "TumorSize")])
+x_B <- as.matrix(df_B[, c("Sex", "TumorSize")])
+x_all <- as.matrix(df[, c("Sex", "TumorSize")])
+
+# --- BJ Linear ---
+fit_A_bj <- bujar(y = log(df_A$T_obs), cens = df_A$delta, x = x_A, learner = "linear.regression", tuning = FALSE)
+fit_B_bj <- bujar(y = log(df_B$T_obs), cens = df_B$delta, x = x_B, learner = "linear.regression", tuning = FALSE)
+Q_A_bj <- exp(predict(fit_A_bj, newx = x_all))
+Q_B_bj <- exp(predict(fit_B_bj, newx = x_all))
+
+# --- BJ Twin Boosting (LS) ---
+fit_A_bjls <- bujar(y = log(df_A$T_obs), cens = df_A$delta, x = x_A,
+                    twin = TRUE, mstop = 1000, mstop2 = 100, cv = FALSE)
+fit_B_bjls <- bujar(y = log(df_B$T_obs), cens = df_B$delta, x = x_B,
+                    twin = TRUE, mstop = 1000, mstop2 = 100, cv = FALSE)
+Q_A_bjls <- exp(predict(fit_A_bjls, newx = x_all))
+Q_B_bjls <- exp(predict(fit_B_bjls, newx = x_all))
+
+# --- BJ Tree Boosting ---
+fit_A_bjtree <- bujar(y = log(df_A$T_obs), cens = df_A$delta, x = x_A,
+                      learner = "tree", tuning = TRUE, degree = 2, 
+                      mstop = 100, cv = FALSE, n.cores = 1, rng = 123)
+fit_B_bjtree <- bujar(y = log(df_B$T_obs), cens = df_B$delta, x = x_B,
+                      learner = "tree", tuning = TRUE, degree = 2, 
+                      mstop = 100, cv = FALSE, n.cores = 1, rng = 123)
+Q_A_bjtree <- exp(predict(fit_A_bjtree, newx = x_all))
+Q_B_bjtree <- exp(predict(fit_B_bjtree, newx = x_all))
+
+# --- Cox models ---
+fit_A_cox <- coxph(Surv(T_obs, delta) ~ Sex + TumorSize, data = df_A)
+fit_B_cox <- coxph(Surv(T_obs, delta) ~ Sex + TumorSize, data = df_B)
+lp_A <- predict(fit_A_cox, newdata = df, type = "lp")
+lp_B <- predict(fit_B_cox, newdata = df, type = "lp")
+base_A <- basehaz(fit_A_cox, centered = FALSE)
+base_B <- basehaz(fit_B_cox, centered = FALSE)
+
+compute_surv <- function(lp, base) {
+  sapply(lp, function(lpi) {
+    sum(diff(c(0, base$time)) * exp(-base$hazard * exp(lpi)))
+  })
+}
+Q_A_cox <- compute_surv(lp_A, base_A)
+Q_B_cox <- compute_surv(lp_B, base_B)
+
+# Add Qs to df
+df$Q_A_bj <- Q_A_bj
+df$Q_B_bj <- Q_B_bj
+df$Q_A_bjls <- Q_A_bjls
+df$Q_B_bjls <- Q_B_bjls
+df$Q_A_bjtree <- Q_A_bjtree
+df$Q_B_bjtree <- Q_B_bjtree
+df$Q_A_cox <- Q_A_cox
+df$Q_B_cox <- Q_B_cox
+
+# Long format for ggplot
+df_long <- pivot_longer(df,
+                        cols = c(Q_A_true, Q_A_bj, Q_A_bjls, Q_A_bjtree, Q_A_cox,
+                                 Q_B_true, Q_B_bj, Q_B_bjls, Q_B_bjtree, Q_B_cox),
+                        names_to = "Model", values_to = "Q_value")
+df_long$Method <- gsub("Q_[AB]_", "", df_long$Model)
+df_long$Treatment <- ifelse(grepl("Q_A_", df_long$Model), "A", "B")
+df_long$TreatmentLabel <- factor(df_long$Model,
+                                 levels = c("Q_A_true", "Q_A_bj", "Q_A_bjls", "Q_A_bjtree", "Q_A_cox",
+                                            "Q_B_true", "Q_B_bj", "Q_B_bjls", "Q_B_bjtree", "Q_B_cox"),
+                                 labels = c("A", "A", "A", "A", "A", "B", "B", "B", "B", "B"))
+df_long$Method <- factor(df_long$Method,
+                         levels = c("true", "bj", "bjls", "bjtree", "cox"))
+colors <- c(
+  "true"    = "#000022",  # very dark blue
+  "bj"      = "#000066",  # dark blue
+  "bjls"    = "#3366CC",  # medium blue
+  "bjtree"  = "#6699FF",  # light blue
+  "cox"     = "#CCE5FF"   # very light blue
+)
+
+# Plot
+ggplot(df_long, aes(x = TreatmentLabel, y = Q_value, fill = Method)) +
+  geom_boxplot(alpha = 0.7, position = position_dodge(width = 0.8)) +
+  labs(title = "True vs Estimated Q-values", x = "Treatment", y = "Q-value", fill = "Method") +
+  scale_fill_manual(values = colors, labels = c("True", "BJ", "BJ-LS", "BJ-Tree", "Cox")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 18),
+        axis.text.y = element_text(size = 16),
+        axis.title.x = element_text(size = 18, face = "bold"),
+        axis.title.y = element_text(size = 18, face = "bold"),
+        plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        legend.title = element_text(size = 16),
+        legend.text = element_text(size = 14))
+
+
+# Repeat simulations 30 times
+n_sim <- 100
+acc_bj_vec <- numeric(n_sim)
+acc_bjls_vec <- numeric(n_sim)
+acc_bjtree_vec <- numeric(n_sim)
+acc_cox_vec <- numeric(n_sim)
+
+for (sim in 1:n_sim) {
+  # Generate data
+  Sex <- rbinom(n, 1, 0.5)
+  TumorSize <- runif(n, -1, 3)
+  TumorSize <- TumorSize^2 - median(TumorSize)
+  Q_A_true <- pmax(beta_0 + beta_1 * Sex + beta_2 * TumorSize + gamma_1 + gamma_2 * TumorSize, 0.001)
+  Q_B_true <- pmax(beta_0 + beta_1 * Sex + beta_2 * TumorSize, 0.001)
+  epsilon <- rnorm(n)
+  A <- rbinom(n, 1, 0.5)
+  T_true <- ifelse(A == 1, Q_A_true, Q_B_true) + epsilon
+  T_true <- pmax(T_true, 0.01)  
+  C <- runif(n, quantile(T_true, 0.2), quantile(T_true, 0.8))
+  Y <- pmin(T_true, C)
+  delta <- as.numeric(T_true <= C)
+  
+  df <- data.frame(Sex, TumorSize, A, T_obs = Y, delta, Q_A_true, Q_B_true)
+  df_A <- df[df$A == 1, ]
+  df_B <- df[df$A == 0, ]
+  x_A <- as.matrix(df_A[, c("Sex", "TumorSize")])
+  x_B <- as.matrix(df_B[, c("Sex", "TumorSize")])
+  x_all <- as.matrix(df[, c("Sex", "TumorSize")])
+  
+  # Fit all models
+  fit_A_bj <- bujar(y = log(df_A$T_obs), cens = df_A$delta, x = x_A, learner = "linear.regression", tuning = FALSE)
+  fit_B_bj <- bujar(y = log(df_B$T_obs), cens = df_B$delta, x = x_B, learner = "linear.regression", tuning = FALSE)
+  Q_A_bj <- exp(predict(fit_A_bj, newx = x_all))
+  Q_B_bj <- exp(predict(fit_B_bj, newx = x_all))
+  
+  fit_A_bjls <- bujar(y = log(df_A$T_obs), cens = df_A$delta, x = x_A,
+                      twin = TRUE, mstop = 1000, mstop2 = 100, cv = FALSE)
+  fit_B_bjls <- bujar(y = log(df_B$T_obs), cens = df_B$delta, x = x_B,
+                      twin = TRUE, mstop = 1000, mstop2 = 100, cv = FALSE)
+  Q_A_bjls <- exp(predict(fit_A_bjls, newx = x_all))
+  Q_B_bjls <- exp(predict(fit_B_bjls, newx = x_all))
+  
+  fit_A_bjtree <- bujar(y = log(df_A$T_obs), cens = df_A$delta, x = x_A,
+                        learner = "tree", tuning = TRUE, degree = 2, 
+                        mstop = 100, cv = FALSE, n.cores = 1, rng = 123)
+  fit_B_bjtree <- bujar(y = log(df_B$T_obs), cens = df_B$delta, x = x_B,
+                        learner = "tree", tuning = TRUE, degree = 2, 
+                        mstop = 100, cv = FALSE, n.cores = 1, rng = 123)
+  Q_A_bjtree <- exp(predict(fit_A_bjtree, newx = x_all))
+  Q_B_bjtree <- exp(predict(fit_B_bjtree, newx = x_all))
+  
+  fit_A_cox <- coxph(Surv(T_obs, delta) ~ Sex + TumorSize, data = df_A)
+  fit_B_cox <- coxph(Surv(T_obs, delta) ~ Sex + TumorSize, data = df_B)
+  lp_A <- predict(fit_A_cox, newdata = df, type = "lp")
+  lp_B <- predict(fit_B_cox, newdata = df, type = "lp")
+  base_A <- basehaz(fit_A_cox, centered = FALSE)
+  base_B <- basehaz(fit_B_cox, centered = FALSE)
+  
+  compute_surv <- function(lp, base) {
+    sapply(lp, function(lpi) {
+      sum(diff(c(0, base$time)) * exp(-base$hazard * exp(lpi)))
+    })
+  }
+  Q_A_cox <- compute_surv(lp_A, base_A)
+  Q_B_cox <- compute_surv(lp_B, base_B)
+  
+  # Estimate optimal decisions
+  true_opt <- ifelse(Q_A_true > Q_B_true, 1, 0)
+  opt_bj <- ifelse(Q_A_bj > Q_B_bj, 1, 0)
+  opt_bjls <- ifelse(Q_A_bjls > Q_B_bjls, 1, 0)
+  opt_bjtree <- ifelse(Q_A_bjtree > Q_B_bjtree, 1, 0)
+  opt_cox <- ifelse(Q_A_cox > Q_B_cox, 1, 0)
+  
+  acc_bj_vec[sim] <- mean(opt_bj == true_opt)
+  acc_bjls_vec[sim] <- mean(opt_bjls == true_opt)
+  acc_bjtree_vec[sim] <- mean(opt_bjtree == true_opt)
+  acc_cox_vec[sim] <- mean(opt_cox == true_opt)
+}
+
+# Summary statistics
+summary(acc_bj_vec)
+summary(acc_bjls_vec)
+summary(acc_bjtree_vec)
+summary(acc_cox_vec)
+
