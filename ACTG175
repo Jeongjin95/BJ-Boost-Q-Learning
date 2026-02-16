@@ -1,0 +1,123 @@
+##############################################################
+##  ACTG175 — Buckley–James Twin Boosting (BJ-LS)
+##               vs Buckley–James Tree Boosting (BJ-Tree)
+##  (arm-specific Q-learning version)
+##############################################################
+
+# -------------------------------
+# Packages
+# -------------------------------
+library(bujar)       # Buckley–James boosting
+library(survival)    # Survival analysis
+library(survminer)   # Kaplan–Meier summary and visualization
+library(dplyr)
+library(ggplot2)
+library(tableone)
+# -------------------------------
+# Load data
+# -------------------------------
+data(ACTG175, package = "speff2trial")
+
+Y     <- ACTG175$days
+Delta <- ACTG175$cens
+A     <- ACTG175$treat   # 0 = control, 1 = treatment
+
+# Exclude non-predictive or post-treatment variables
+X <- subset(
+  ACTG175,
+  select = -c(days, cens, treat, cd496, cd420, cd820,
+              r, offtrt, drugs, arms, pidnum)
+)
+X <- as.matrix(X)
+
+# Treatment-specific subsets
+idx0 <- which(A == 0)
+idx1 <- which(A == 1)
+X0   <- X[idx0, , drop = FALSE]
+X1   <- X[idx1, , drop = FALSE]
+Y0   <- Y[idx0]; Y1 <- Y[idx1]
+D0   <- Delta[idx0]; D1 <- Delta[idx1]
+
+# ==============================================================
+# 1. Buckley–James Twin Boosting (BJ-LS)
+# ==============================================================
+
+fit0_bjls <- bujar(
+  y = log(Y0), cens = D0, x = X0,
+  twin = TRUE, mstop = 1000, mstop2 = 100, cv = FALSE
+)
+fit1_bjls <- bujar(
+  y = log(Y1), cens = D1, x = X1,
+  twin = TRUE, mstop = 1000, mstop2 = 100, cv = FALSE
+)
+
+Q0_BJLS <- exp(predict(fit0_bjls, newx = X))  # predicted mean survival under A=0
+Q1_BJLS <- exp(predict(fit1_bjls, newx = X))  # predicted mean survival under A=1
+
+wilcox.test(Q1_BJLS, Q0_BJLS, paired = TRUE)
+# ==============================================================
+# 2. Buckley–James Tree Boosting (BJ-Tree)
+# ==============================================================
+
+fit0_bjtree <- bujar(
+  y = log(Y0), cens = D0, x = X0,
+  learner = "tree", tuning = TRUE, cv = TRUE,
+  degree = 4, mstop = 1000, n.cores = 1, rng = 123
+)
+fit1_bjtree <- bujar(
+  y = log(Y1), cens = D1, x = X1,
+  learner = "tree", tuning = TRUE, cv = TRUE,
+  degree = 4, mstop = 1000, n.cores = 1, rng = 123
+)
+
+Q0_BJTree <- exp(predict(fit0_bjtree, newx = X))
+Q1_BJTree <- exp(predict(fit1_bjtree, newx = X))
+
+wilcox.test(Q1_BJTree, Q0_BJTree, paired = TRUE)
+# ==============================================================
+# 5. Treatment recommendation rule
+# ==============================================================
+
+# Decision rules: treat (A=1) if Q1 > Q0
+d_BJLS   <- as.integer(Q1_BJLS   > Q0_BJLS)
+d_BJTree <- as.integer(Q1_BJTree > Q0_BJTree)
+
+# Summary counts
+tab_recommend <- tibble(
+  Method            = c("BJ-LS (Twin Boosting)", "BJ-Tree (Boosting)"),
+  Recommend_Treat   = c(sum(d_BJLS==1), sum(d_BJTree==1)),
+  Recommend_Control = c(sum(d_BJLS==0), sum(d_BJTree==0))
+)
+
+print(tab_recommend)
+
+# ==============================================================
+# Clinical profile by recommended treatment (all baseline vars)
+# ==============================================================
+
+# Combine recommendation with original data
+actg_df <- ACTG175 %>%
+  mutate(
+    Rec_BJLS = factor(d_BJLS, labels = c("Control", "Treat")),
+    Rec_BJTree = factor(d_BJTree, labels = c("Control", "Treat"))
+  )
+
+# Define baseline variables: exactly those used in model (X)
+baseline_vars <- colnames(subset(
+  ACTG175,
+  select = -c(days, cens, treat, cd496, cd420, cd820,
+              r, offtrt, drugs, arms, pidnum)
+))
+
+# CreateTableOne for BJ-LS and BJ-Tree
+tab_BJLS <- CreateTableOne(vars = baseline_vars, strata = "Rec_BJLS", data = actg_df)
+tab_BJTree <- CreateTableOne(vars = baseline_vars, strata = "Rec_BJTree", data = actg_df)
+
+# Print summaries
+cat("\n=== Baseline Characteristics by Recommended Treatment (BJ-LS) ===\n")
+print(tab_BJLS, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
+
+cat("\n=== Baseline Characteristics by Recommended Treatment (BJ-Tree) ===\n")
+print(tab_BJTree, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
+
+
