@@ -1,0 +1,428 @@
+##############################################################
+##  CALGB8923  Two stage Q learning with bujar
+##  Stage 2: BJ (linear), BJ-LS, BJ-Tree, Cox
+##  Stage 1: BJ (linear), BJ-LS, BJ-Tree, Cox
+##
+##  Notes
+##  1) bujar requires numeric x, so we use model.matrix with + 0
+##  2) calgb8923 is often in long format
+##  3) Cox Q is computed as restricted mean survival time from arm specific coxph
+##############################################################
+
+suppressPackageStartupMessages({
+  library(mets)
+  library(bujar)
+  library(survival)
+  library(dplyr)
+  library(tibble)
+  library(tableone)
+})
+
+set.seed(123)
+
+## -----------------------------------------------------------
+## Helper: RMST from Cox model using basehaz
+## -----------------------------------------------------------
+rmst_from_cox <- function(fit, newX, tau = NULL) {
+  bh <- basehaz(fit, centered = FALSE)
+  times <- bh$time
+  haz   <- bh$hazard
+  
+  if (is.null(tau)) tau <- max(times)
+  
+  times2 <- c(0, times)
+  haz2   <- c(0, haz)
+  
+  keep <- which(times2 <= tau)
+  tvec <- times2[keep]
+  Hvec <- haz2[keep]
+  
+  if (tail(tvec, 1) < tau) {
+    tvec <- c(tvec, tau)
+    Hvec <- c(Hvec, tail(Hvec, 1))
+  }
+  
+  dt <- diff(tvec)
+  H_left <- Hvec[-length(Hvec)]
+  
+  beta <- coef(fit)
+  lp <- as.vector(as.matrix(newX) %*% beta)
+  risk <- exp(lp)
+  
+  out <- vapply(risk, function(r) sum(exp(-H_left * r) * dt), numeric(1))
+  out
+}
+
+## -----------------------------------------------------------
+## 0. Load data
+## -----------------------------------------------------------
+data(calgb8923, package = "mets")
+df <- calgb8923
+
+##############################################################
+##  STAGE 2
+##############################################################
+
+## -----------------------------------------------------------
+## 1. Stage 2 cohort and outcome
+## -----------------------------------------------------------
+df2 <- df %>%
+  filter(R == 1, consent == 1) %>%
+  filter(!is.na(A1)) %>%
+  mutate(
+    Y2 = pmax(time - TR, 1e-1),
+    Delta2 = as.integer(status == 1),
+    A2 = A1
+  )
+
+X2 <- model.matrix(~ age + wbc + sex + race + 0, data = df2)
+X2 <- apply(X2, 2, as.numeric)
+X2 <- as.matrix(X2)
+
+Y2 <- df2$Y2
+D2 <- df2$Delta2
+A2 <- df2$A2
+
+idx2_0 <- which(A2 == 0)
+idx2_1 <- which(A2 == 1)
+
+X20 <- X2[idx2_0, , drop = FALSE]
+X21 <- X2[idx2_1, , drop = FALSE]
+Y20 <- Y2[idx2_0]; Y21 <- Y2[idx2_1]
+D20 <- D2[idx2_0]; D21 <- D2[idx2_1]
+
+n_stage2 <- nrow(df2)
+n_event2 <- sum(df2$Delta2 == 1)
+n_cens2  <- sum(df2$Delta2 == 0)
+cens_rate2 <- n_cens2 / n_stage2
+
+cat("\nStage 2 sample size and censoring\n")
+cat("Number of subjects:", n_stage2, "\n")
+cat("Number of events:", n_event2, "\n")
+cat("Number censored:", n_cens2, "\n")
+cat("Censoring rate:", round(cens_rate2, 3), "\n")
+
+## -----------------------------------------------------------
+## 2. Stage 2 models (fit order: BJ, BJ-LS, BJ-Tree, Cox)
+## -----------------------------------------------------------
+
+## -------- Stage 2 BJ (linear.regression) --------
+fit2_0_bj <- bujar(
+  y = log(Y20), cens = D20, x = X20,
+  learner = "linear.regression",
+  tuning = FALSE, cv = FALSE,
+  rng = 123, trace = FALSE
+)
+fit2_1_bj <- bujar(
+  y = log(Y21), cens = D21, x = X21,
+  learner = "linear.regression",
+  tuning = FALSE, cv = FALSE,
+  rng = 123, trace = FALSE
+)
+
+Q2_0_BJ <- exp(predict(fit2_0_bj, newx = X2))
+Q2_1_BJ <- exp(predict(fit2_1_bj, newx = X2))
+
+cat("\nStage 2 paired Wilcoxon (BJ):\n")
+print(wilcox.test(Q2_0_BJ, Q2_1_BJ, paired = TRUE))
+
+d2_BJ <- as.integer(Q2_1_BJ > Q2_0_BJ)
+cat("\nStage 2 recommendations (BJ):\n")
+print(table(d2_BJ))
+
+## -------- Stage 2 BJ-LS (twin boosting) --------
+fit2_0_bjls <- bujar(
+  y = log(Y20), cens = D20, x = X20,
+  twin = TRUE, mstop = 1000, mstop2 = 100,
+  tuning = FALSE, cv = FALSE,
+  rng = 123, trace = FALSE
+)
+fit2_1_bjls <- bujar(
+  y = log(Y21), cens = D21, x = X21,
+  twin = TRUE, mstop = 1000, mstop2 = 100,
+  tuning = FALSE, cv = FALSE,
+  rng = 123, trace = FALSE
+)
+
+Q2_0_BJLS <- exp(predict(fit2_0_bjls, newx = X2))
+Q2_1_BJLS <- exp(predict(fit2_1_bjls, newx = X2))
+
+cat("\nStage 2 paired Wilcoxon (BJ-LS):\n")
+print(wilcox.test(Q2_0_BJLS, Q2_1_BJLS, paired = TRUE))
+
+d2_BJLS <- as.integer(Q2_1_BJLS > Q2_0_BJLS)
+cat("\nStage 2 recommendations (BJ-LS):\n")
+print(table(d2_BJLS))
+
+## -------- Stage 2 BJ-Tree --------
+fit2_0_bjtree <- bujar(
+  y = log(Y20), cens = D20, x = X20,
+  learner = "tree", tuning = TRUE, cv = FALSE,
+  degree = 3, mstop = 1000, n.cores = 1,
+  rng = 123, trace = FALSE
+)
+fit2_1_bjtree <- bujar(
+  y = log(Y21), cens = D21, x = X21,
+  learner = "tree", tuning = TRUE, cv = FALSE,
+  degree = 3, mstop = 1000, n.cores = 1,
+  rng = 123, trace = FALSE
+)
+
+Q2_0_BJTree <- exp(predict(fit2_0_bjtree, newx = X2))
+Q2_1_BJTree <- exp(predict(fit2_1_bjtree, newx = X2))
+
+cat("\nStage 2 paired Wilcoxon (BJ-Tree):\n")
+print(wilcox.test(Q2_0_BJTree, Q2_1_BJTree, paired = TRUE))
+
+d2_BJTree <- as.integer(Q2_1_BJTree > Q2_0_BJTree)
+cat("\nStage 2 recommendations (BJ-Tree):\n")
+print(table(d2_BJTree))
+
+## -------- Stage 2 Cox (arm specific, Q as RMST) --------
+df2_cox <- as.data.frame(X2)
+df2_cox$Y2 <- Y2
+df2_cox$Delta2 <- D2
+
+fit2_0_cox <- coxph(Surv(Y2, Delta2) ~ .,
+                    data = df2_cox[idx2_0, ],
+                    ties = "breslow")
+fit2_1_cox <- coxph(Surv(Y2, Delta2) ~ .,
+                    data = df2_cox[idx2_1, ],
+                    ties = "breslow")
+
+tau2 <- min(max(basehaz(fit2_0_cox, centered = FALSE)$time),
+            max(basehaz(fit2_1_cox, centered = FALSE)$time))
+
+Q2_0_Cox <- rmst_from_cox(fit2_0_cox, X2, tau = tau2)
+Q2_1_Cox <- rmst_from_cox(fit2_1_cox, X2, tau = tau2)
+
+cat("\nStage 2 paired Wilcoxon (Cox RMST):\n")
+print(wilcox.test(Q2_0_Cox, Q2_1_Cox, paired = TRUE))
+
+d2_Cox <- as.integer(Q2_1_Cox > Q2_0_Cox)
+cat("\nStage 2 recommendations (Cox RMST):\n")
+print(table(d2_Cox))
+
+## -----------------------------------------------------------
+## Stage 2 table (ordered BJ, BJ-LS, BJ-Tree, Cox)
+## -----------------------------------------------------------
+tab_stage2_rec <- tibble(
+  Method = c("Stage 2 BJ", "Stage 2 BJ-LS", "Stage 2 BJ-Tree", "Stage 2 Cox"),
+  Recommend_A2_1 = c(sum(d2_BJ == 1),   sum(d2_BJLS == 1),   sum(d2_BJTree == 1), sum(d2_Cox == 1)),
+  Recommend_A2_0 = c(sum(d2_BJ == 0),   sum(d2_BJLS == 0),   sum(d2_BJTree == 0), sum(d2_Cox == 0))
+)
+
+cat("\nStage 2 recommendation counts (BJ, BJ-LS, BJ-Tree, Cox)\n")
+print(tab_stage2_rec)
+
+baseline_vars <- c("age", "wbc", "sex", "race")
+
+df2_tab <- df2 %>%
+  mutate(
+    Rec_BJ     = factor(d2_BJ,     levels = c(0, 1), labels = c("A2=0", "A2=1")),
+    Rec_BJLS   = factor(d2_BJLS,   levels = c(0, 1), labels = c("A2=0", "A2=1")),
+    Rec_BJTree = factor(d2_BJTree, levels = c(0, 1), labels = c("A2=0", "A2=1")),
+    Rec_Cox    = factor(d2_Cox,    levels = c(0, 1), labels = c("A2=0", "A2=1"))
+  )
+
+tab_BJ <- CreateTableOne(vars = baseline_vars, strata = "Rec_BJ", data = df2_tab, test = TRUE)
+tab_BJLS <- CreateTableOne(vars = baseline_vars, strata = "Rec_BJLS", data = df2_tab, test = TRUE)
+tab_BJTree <- CreateTableOne(vars = baseline_vars, strata = "Rec_BJTree", data = df2_tab, test = TRUE)
+tab_Cox <- CreateTableOne(vars = baseline_vars, strata = "Rec_Cox", data = df2_tab, test = TRUE)
+
+cat("\n=== Stage 2 baseline by recommended A2 (BJ) ===\n")
+print(tab_BJ, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
+
+cat("\n=== Stage 2 baseline by recommended A2 (BJ-LS) ===\n")
+print(tab_BJLS, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
+
+cat("\n=== Stage 2 baseline by recommended A2 (BJ-Tree) ===\n")
+print(tab_BJTree, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
+
+cat("\n=== Stage 2 baseline by recommended A2 (Cox RMST) ===\n")
+print(tab_Cox, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
+
+
+
+##############################################################
+##  STAGE 1 (Stage 1 only; no pseudo outcome backward induction)
+##############################################################
+
+## -----------------------------------------------------------
+## 1) Build Stage 1 subject level data
+## -----------------------------------------------------------
+df1 <- df %>%
+  filter(R == 0) %>%
+  filter(!is.na(A0)) %>%
+  mutate(
+    Y1 = pmax(time, 1e-1),
+    Delta1 = as.integer(status == 1),
+    A1 = A0
+  )
+
+X1 <- model.matrix(~ age + wbc + sex + race + 0, data = df1)
+X1 <- as.matrix(X1)
+storage.mode(X1) <- "double"
+
+Y1 <- df1$Y1
+D1 <- df1$Delta1
+A1 <- df1$A1
+
+idx1_0 <- which(A1 == 0)
+idx1_1 <- which(A1 == 1)
+
+X10 <- X1[idx1_0, , drop = FALSE]
+X11 <- X1[idx1_1, , drop = FALSE]
+Y10 <- Y1[idx1_0]; Y11 <- Y1[idx1_1]
+D10 <- D1[idx1_0]; D11 <- D1[idx1_1]
+
+n_stage1 <- nrow(df1)
+n_event1 <- sum(df1$Delta1 == 1)
+n_cens1  <- sum(df1$Delta1 == 0)
+cens_rate1 <- n_cens1 / n_stage1
+
+cat("\nStage 1 sample size and censoring\n")
+cat("Number of subjects:", n_stage1, "\n")
+cat("Number of events:", n_event1, "\n")
+cat("Number censored:", n_cens1, "\n")
+cat("Censoring rate:", round(cens_rate1, 3), "\n")
+
+## -----------------------------------------------------------
+## 2) Stage 1 models (fit order: BJ, BJ-LS, BJ-Tree, Cox)
+## -----------------------------------------------------------
+
+## -------- Stage 1 BJ (linear.regression) --------
+fit1_0_bj <- bujar(
+  y = log(Y10), cens = as.integer(D10), x = as.matrix(X10),
+  learner = "linear.regression",
+  tuning = FALSE, cv = FALSE,
+  rng = 123, trace = FALSE
+)
+fit1_1_bj <- bujar(
+  y = log(Y11), cens = as.integer(D11), x = as.matrix(X11),
+  learner = "linear.regression",
+  tuning = FALSE, cv = FALSE,
+  rng = 123, trace = FALSE
+)
+
+Q1_0_BJ <- exp(predict(fit1_0_bj, newx = X1))
+Q1_1_BJ <- exp(predict(fit1_1_bj, newx = X1))
+
+cat("\nStage 1 paired Wilcoxon (BJ):\n")
+print(wilcox.test(Q1_1_BJ, Q1_0_BJ, paired = TRUE))
+
+d1_BJ <- as.integer(Q1_1_BJ > Q1_0_BJ)
+cat("\nStage 1 recommendations (BJ):\n")
+print(table(d1_BJ))
+
+## -------- Stage 1 BJ-LS --------
+fit1_0_bjls <- bujar(
+  y = log(Y10), cens = as.integer(D10), x = as.matrix(X10),
+  twin = TRUE, mstop = 1000, mstop2 = 100,
+  tuning = FALSE, cv = FALSE,
+  rng = 123, trace = FALSE
+)
+fit1_1_bjls <- bujar(
+  y = log(Y11), cens = as.integer(D11), x = as.matrix(X11),
+  twin = TRUE, mstop = 1000, mstop2 = 100,
+  tuning = FALSE, cv = FALSE,
+  rng = 123, trace = FALSE
+)
+
+Q1_0_BJLS <- exp(predict(fit1_0_bjls, newx = X1))
+Q1_1_BJLS <- exp(predict(fit1_1_bjls, newx = X1))
+
+cat("\nStage 1 paired Wilcoxon (BJ-LS):\n")
+print(wilcox.test(Q1_1_BJLS, Q1_0_BJLS, paired = TRUE))
+
+d1_BJLS <- as.integer(Q1_1_BJLS > Q1_0_BJLS)
+cat("\nStage 1 recommendations (BJ-LS):\n")
+print(table(d1_BJLS))
+
+## -------- Stage 1 BJ-Tree --------
+fit1_0_bjtree <- bujar(
+  y = log(Y10), cens = as.integer(D10), x = as.matrix(X10),
+  learner = "tree", tuning = TRUE, cv = FALSE,
+  degree = 3, mstop = 1000, n.cores = 1,
+  rng = 123, trace = FALSE
+)
+fit1_1_bjtree <- bujar(
+  y = log(Y11), cens = as.integer(D11), x = as.matrix(X11),
+  learner = "tree", tuning = TRUE, cv = FALSE,
+  degree = 3, mstop = 1000, n.cores = 1,
+  rng = 123, trace = FALSE
+)
+
+Q1_0_BJTree <- exp(predict(fit1_0_bjtree, newx = X1))
+Q1_1_BJTree <- exp(predict(fit1_1_bjtree, newx = X1))
+
+cat("\nStage 1 paired Wilcoxon (BJ-Tree):\n")
+print(wilcox.test(Q1_1_BJTree, Q1_0_BJTree, paired = TRUE))
+
+d1_BJTree <- as.integer(Q1_1_BJTree > Q1_0_BJTree)
+cat("\nStage 1 recommendations (BJ-Tree):\n")
+print(table(d1_BJTree))
+
+## -------- Stage 1 Cox (arm specific, Q as RMST) --------
+df1_cox <- as.data.frame(X1)
+df1_cox$Y1 <- Y1
+df1_cox$Delta1 <- D1
+
+fit1_0_cox <- coxph(Surv(Y1, Delta1) ~ .,
+                    data = df1_cox[idx1_0, ],
+                    ties = "breslow")
+fit1_1_cox <- coxph(Surv(Y1, Delta1) ~ .,
+                    data = df1_cox[idx1_1, ],
+                    ties = "breslow")
+
+tau1 <- min(max(basehaz(fit1_0_cox, centered = FALSE)$time),
+            max(basehaz(fit1_1_cox, centered = FALSE)$time))
+
+Q1_0_Cox <- rmst_from_cox(fit1_0_cox, X1, tau = tau1)
+Q1_1_Cox <- rmst_from_cox(fit1_1_cox, X1, tau = tau1)
+
+cat("\nStage 1 paired Wilcoxon (Cox RMST):\n")
+print(wilcox.test(Q1_1_Cox, Q1_0_Cox, paired = TRUE))
+
+d1_Cox <- as.integer(Q1_1_Cox > Q1_0_Cox)
+cat("\nStage 1 recommendations (Cox RMST):\n")
+print(table(d1_Cox))
+
+## -----------------------------------------------------------
+## Stage 1 table (ordered BJ, BJ-LS, BJ-Tree, Cox)
+## -----------------------------------------------------------
+tab_stage1_rec <- tibble(
+  Method = c("Stage 1 BJ", "Stage 1 BJ-LS", "Stage 1 BJ-Tree", "Stage 1 Cox"),
+  Recommend_A1_1 = c(sum(d1_BJ == 1),   sum(d1_BJLS == 1),   sum(d1_BJTree == 1), sum(d1_Cox == 1)),
+  Recommend_A1_0 = c(sum(d1_BJ == 0),   sum(d1_BJLS == 0),   sum(d1_BJTree == 0), sum(d1_Cox == 0))
+)
+
+cat("\nStage 1 recommendation counts (BJ, BJ-LS, BJ-Tree, Cox)\n")
+print(tab_stage1_rec)
+
+baseline_vars <- c("age", "wbc", "sex", "race")
+
+df1_tab <- df1 %>%
+  mutate(
+    Rec_BJ     = factor(d1_BJ,     levels = c(0, 1), labels = c("A1=0", "A1=1")),
+    Rec_BJLS   = factor(d1_BJLS,   levels = c(0, 1), labels = c("A1=0", "A1=1")),
+    Rec_BJTree = factor(d1_BJTree, levels = c(0, 1), labels = c("A1=0", "A1=1")),
+    Rec_Cox    = factor(d1_Cox,    levels = c(0, 1), labels = c("A1=0", "A1=1"))
+  )
+
+tab_BJ <- CreateTableOne(vars = baseline_vars, strata = "Rec_BJ", data = df1_tab, test = TRUE)
+tab_BJLS <- CreateTableOne(vars = baseline_vars, strata = "Rec_BJLS", data = df1_tab, test = TRUE)
+tab_BJTree <- CreateTableOne(vars = baseline_vars, strata = "Rec_BJTree", data = df1_tab, test = TRUE)
+tab_Cox <- CreateTableOne(vars = baseline_vars, strata = "Rec_Cox", data = df1_tab, test = TRUE)
+
+cat("\n=== Stage 1 baseline by recommended A1 (BJ) ===\n")
+print(tab_BJ, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
+
+cat("\n=== Stage 1 baseline by recommended A1 (BJ-LS) ===\n")
+print(tab_BJLS, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
+
+cat("\n=== Stage 1 baseline by recommended A1 (BJ-Tree) ===\n")
+print(tab_BJTree, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
+
+cat("\n=== Stage 1 baseline by recommended A1 (Cox RMST) ===\n")
+print(tab_Cox, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
