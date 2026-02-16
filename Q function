@@ -21,14 +21,12 @@ simulate_stage <- function(seed) {
   gamma_1 <- 0.05
   gamma_2 <- 1.5
   
-  
   # True Q-values
   TumorSize.trans <- TumorSize^(2.3) - median(TumorSize^(2))
   Q_A_true <- pmax(beta_0 + beta_1 * Sex + beta_2 * TumorSize.trans + beta_3 * log(BMI) + beta_4 * sqrt(Age)
                    + gamma_1 + gamma_2 * TumorSize.trans, 0.001)
   Q_B_true <- pmax(beta_0 + beta_1 * Sex + beta_2 * TumorSize.trans + beta_3 * log(BMI) + beta_4 * sqrt(Age)
                    , 0.001)
-  
   epsilon <- rnorm(n)
   A <- rbinom(n, 1, 0.5)
   T_true <- ifelse(A == 1, Q_A_true, Q_B_true) + epsilon
@@ -58,7 +56,6 @@ simulate_stage <- function(seed) {
   fit_B_bjtree <- bujar(log(df_B$T_obs), df_B$delta, x_B, learner = "tree", tuning = TRUE, degree = 2, mstop = 100, cv = FALSE)
   Q_A_bjtree <- exp(predict(fit_A_bjtree, newx = x_all))
   Q_B_bjtree <- exp(predict(fit_B_bjtree, newx = x_all))
-  
   
   # Cox
   fit_A_cox <- coxph(Surv(T_obs, delta) ~ Sex + TumorSize, data = df_A)
